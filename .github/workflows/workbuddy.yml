@@ -41,6 +41,22 @@ jobs:
           restore-keys: |
             workbuddy-benefit-state-
 
+      # 解密上轮持久化的令牌库（公开仓库中只保存密文，密钥在 secrets.WB_STATE_KEY）
+      - name: Decrypt token store
+        env:
+          WB_STATE_KEY: ${{ secrets.WB_STATE_KEY }}
+        run: |
+          if [ -z "$WB_STATE_KEY" ]; then
+            echo "未配置 WB_STATE_KEY，跳过解密（本轮将从 secret 自举）"
+            exit 0
+          fi
+          for f in wb_refresh_tokens.json wb_intl_tokens.json; do
+            if [ -f "$f.enc" ]; then
+              openssl enc -d -aes-256-cbc -pbkdf2 -in "$f.enc" -out "$f" -pass env:WB_STATE_KEY
+              echo "已解密 $f.enc -> $f"
+            fi
+          done
+
       - name: Detect account config
         id: config
         env:
@@ -100,18 +116,30 @@ jobs:
         if: ${{ always() && steps.config.outputs.cn != 'true' && steps.config.outputs.intl != 'true' }}
         run: echo "::warning::未配置 WORKBUDDY_REFRESH_TOKEN 或 WORKBUDDY_INTL_TOKENS/WORKBUDDY_TOKEN，跳过签到。"
 
-      # ⚠️ 仅在【私有仓库】中持久化令牌/福利期次状态；公开仓库会跳过，避免 RT 泄露
-      - name: Persist runtime state (private repo only)
-        if: always() && github.event.repository.private == true
+      # 加密持久化：令牌库只以密文（.enc）提交，明文永不落仓库；密钥在 secrets.WB_STATE_KEY
+      - name: Persist runtime state (encrypted)
+        if: always()
+        env:
+          WB_STATE_KEY: ${{ secrets.WB_STATE_KEY }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f wb_refresh_tokens.json 2>/dev/null || true
-          git add -f wb_intl_tokens.json 2>/dev/null || true
-          git add -f workbuddy_benefit_state.json 2>/dev/null || true
+          if [ -n "$WB_STATE_KEY" ]; then
+            for f in wb_refresh_tokens.json wb_intl_tokens.json; do
+              if [ -f "$f" ]; then
+                openssl enc -aes-256-cbc -pbkdf2 -in "$f" -out "$f.enc" -pass env:WB_STATE_KEY
+                git add -f "$f.enc"
+              fi
+            done
+          else
+            echo "::warning::未配置 WB_STATE_KEY，令牌库不持久化，下轮将从 secret 重新自举。"
+          fi
+          if [ -f workbuddy_benefit_state.json ]; then
+            git add -f workbuddy_benefit_state.json
+          fi
           if git diff --cached --quiet; then
             echo "运行状态无变化"
           else
-            git commit -m "chore: 更新运行状态 [skip ci]"
+            git commit -m "chore: 更新运行状态(加密) [skip ci]"
             git push
           fi
